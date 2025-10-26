@@ -1,5 +1,5 @@
 [package]
-name = "searxng_scraper"
+name = "Researcher"
 version = "1.0.0"
 edition = "2021"
 

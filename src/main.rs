@@ -11,6 +11,8 @@
 // The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+mod web;
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use ollama_rs::Ollama;
@@ -22,45 +24,51 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 
-
 // CL arguments for config
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "SearXNG Scientific DOI Scraper with AI Validation", long_about = None)]
-struct Args {
+pub struct Args {
     #[arg(short, long, default_value = "machine learning")]
-    subject: String,
+    pub subject: String,
 
     #[arg(short, long, default_value = "https://searxng.site/")]
-    instance: String,
+    pub instance: String,
 
     #[arg(short, long, default_value = "50")]
-    max_results: usize,
+    pub max_results: usize,
 
     #[arg(short, long, default_value = "results.txt")]
-    output: String,
+    pub output: String,
 
     #[arg(long, default_value = "llama3.2:latest")]
-    model: String,
+    pub model: String,
 
     #[arg(long, default_value_t = false)]
-    no_ai: bool,
+    pub no_ai: bool,
 
     #[arg(short, long, default_value = "")]
-    time_range: String,
+    pub time_range: String,
 
     #[arg(short, long, default_value = "science")]
-    category: String,
+    pub category: String,
 
     #[arg(short, long, default_value = "arxiv,pubmed,google scholar,crossref,openairepublications,openairedatasets,semantic scholar")]
-    engines: String,
+    pub engines: String,
 
     #[arg(long, default_value = "0.6")]
-    min_score: f32,
+    pub min_score: f32,
 
     #[arg(short, long, default_value_t = false)]
-    verbose: bool,
+    pub verbose: bool,
+
+    #[arg(long, default_value = "6601")]
+    pub web_poort: u16,
+
+    #[arg(long, default_value = "http://localhost:11434")]
+    pub ollama_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,7 +76,7 @@ struct SearxngResponse {
     results: Vec<SearchResult>,
 }
 
-// Represents one search result from SearX
+// Represents one search result from SearXNG
 #[derive(Debug, Deserialize, Clone)]
 struct SearchResult {
     title: String,
@@ -125,7 +133,7 @@ struct DataCiteDescription {
 }
 
 #[derive(Debug)]
-struct ScientificPaper {
+pub struct ScientificPaper {
     title: String,
     url: String,
     doi: Option<String>,
@@ -133,17 +141,35 @@ struct ScientificPaper {
     relevance_score: f32,
 }
 
-struct DOIScraper {
+pub struct DOIScraper {
     client: Client,
     ollama: Option<Ollama>,
     processed_dois: HashSet<String>,
     args: Args,
     doi_regex: Regex,
     use_ai: bool,
+    logger: Option<Arc<Mutex<Vec<String>>>>,
 }
 
-impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-LaTeX-generator
-    async fn new(args: Args) -> Result<Self> {
+impl DOIScraper {
+    pub async fn new(args: Args) -> Result<Self> {
+        Self::new_with_logger(args, None).await
+    }
+
+    fn safe_truncate(s: &str, max_len: usize) -> &str {
+        if s.len() <= max_len {
+            return s;
+        }
+        
+        // Find the last valid char boundary at or before max_len
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    pub async fn new_with_logger(args: Args, logger: Option<Arc<Mutex<Vec<String>>>>) -> Result<Self> {
         let user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
@@ -175,48 +201,62 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             .build()?;
 
         let (ollama, use_ai) = if args.no_ai {
-            println!("{}", "=".repeat(64));
-            println!("AI validation is disabled (--no-ai flag)");
-            println!("{}\n", "=".repeat(64));
+            Self::log(&logger, &format!("{}", "=".repeat(64)));
+            Self::log(&logger, "AI validation is disabled (--no-ai flag)");
+            Self::log(&logger, &format!("{}\n", "=".repeat(64)));
             (None, false)
         } else {
-            let ollama_client = Ollama::default();
+            let url = args.ollama_url.trim_end_matches('/');
+            let (host, port) = if let Some(idx) = url.rfind(':') {
+                let port_str = &url[idx+1..];
+                if let Ok(port) = port_str.parse::<u16>() {
+                    (&url[..idx], port)
+                } else {
+                    (url, 11434)
+                }
+            } else {
+                (url, 11434)
+            };
+            
+            let ollama_client = Ollama::new(host, port);
             match ollama_client.list_local_models().await {
                 Ok(_) => {
-                    println!("{}", "=".repeat(64));
-                    println!("Ollama available, model: {}", args.model);
-                    println!("{}\n", "=".repeat(64));
+                    Self::log(&logger, &format!("{}", "=".repeat(64)));
+                    Self::log(&logger, &format!("Ollama available at: {}:{}", host, port));
+                    Self::log(&logger, &format!("Model: {}", args.model));
+                    Self::log(&logger, &format!("{}\n", "=".repeat(64)));
                     (Some(ollama_client), true)
                 }
                 Err(_) => {
-                    println!("{}", "=".repeat(64));
-                    println!("Ollama not available, AI validation disabled");
-                    println!("{}\n", "=".repeat(64));
+                    Self::log(&logger, &format!("{}", "=".repeat(64)));
+                    Self::log(&logger, &format!("Ollama not available at: {}:{}", host, port));
+                    Self::log(&logger, "AI validation disabled");
+                    Self::log(&logger, &format!("{}\n", "=".repeat(64)));
                     (None, false)
                 }
             }
         };
 
-        let processed_dois = Self::load_processed_dois(&args.output)?; // Reads previously saved DOIs from the output file to prevent dupes
+        let processed_dois = Self::load_processed_dois(&args.output)?;
         let doi_regex = Regex::new(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+").unwrap();
 
-        println!("{}", "=".repeat(64));
-        println!("   SearXNG Scientific DOI Scraper with AI Validation");
-        println!("{}", "=".repeat(64));
-        println!("\nSubject: {}", args.subject);
-        println!("Instance: {}", args.instance);
-        println!("Engines: {}", args.engines);
+        Self::log(&logger, &format!("{}", "=".repeat(64)));
+        Self::log(&logger, "   SearXNG Scientific DOI Scraper with AI Validation");
+        Self::log(&logger, &format!("{}", "=".repeat(64)));
+        Self::log(&logger, &format!("\nSubject: {}", args.subject));
+        Self::log(&logger, &format!("Instance: {}", args.instance));
+        Self::log(&logger, &format!("Engines: {}", args.engines));
         
         if !args.time_range.is_empty() {
-            println!("Time range: {}", args.time_range);
+            Self::log(&logger, &format!("Time range: {}", args.time_range));
         } else {
-            println!("Time range: all time");
+            Self::log(&logger, "Time range: all time");
         }
         
-        println!("Max results: {}", args.max_results);
-        println!("Min score: {:.1}", args.min_score);
-        println!("Output: {}", args.output);
-        println!("Previously processed: {} DOIs\n", processed_dois.len());
+        Self::log(&logger, &format!("Max results: {}", args.max_results));
+        Self::log(&logger, &format!("Min score: {:.1}", args.min_score));
+        Self::log(&logger, &format!("Output: {}", args.output));
+        Self::log(&logger, &format!("Previously processed: {} DOIs\n", processed_dois.len()));
 
         Ok(Self {
             client,
@@ -225,7 +265,22 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             args,
             doi_regex,
             use_ai,
+            logger,
         })
+    }
+
+    fn log(logger: &Option<Arc<Mutex<Vec<String>>>>, message: &str) {
+        println!("{}", message);
+        if let Some(log) = logger {
+            if let Ok(mut logs) = log.lock() {
+                let timestamp = chrono::Local::now().format("%H:%M:%S");
+                let log_entry = format!("[{}] {}", timestamp, message);
+                logs.push(log_entry);
+                if logs.len() > 500 {
+                    logs.remove(0);
+                }
+            }
+        }
     }
 
     fn load_processed_dois(filepath: &str) -> Result<HashSet<String>> {
@@ -240,7 +295,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         Ok(dois)
     }
 
-    fn clean_doi(&self, doi: &str) -> String { // Normalize DOI strings
+    fn clean_doi(&self, doi: &str) -> String {
         let mut cleaned = doi.trim().to_string();
         
         if cleaned.starts_with("https://doi.org/") {
@@ -289,7 +344,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         let clean_doi = self.clean_doi(doi);
         
         if self.args.verbose {
-            println!("      [API] Trying doi.org for: {}", clean_doi);
+            Self::log(&self.logger, &format!("      [API] Trying doi.org for: {}", clean_doi));
         }
         
         if let Ok(response) = self.client
@@ -312,7 +367,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
                             
                             if !title.is_empty() {
                                 if self.args.verbose {
-                                    println!("      [API] doi.org success");
+                                    Self::log(&self.logger, "      [API] doi.org success");
                                 }
                                 return Ok((title, abstract_text));
                             }
@@ -323,7 +378,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         }
 
         if self.args.verbose {
-            println!("      [API] Attempting via CrossRef");
+            Self::log(&self.logger, "      [API] Attempting via CrossRef");
         }
         
         if let Ok(response) = self.client
@@ -343,7 +398,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
                     
                     if !title.is_empty() {
                         if self.args.verbose {
-                            println!("      [API] CrossRef success");
+                            Self::log(&self.logger, "      [API] CrossRef success");
                         }
                         return Ok((title, abstract_text));
                     }
@@ -352,7 +407,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         }
 
         if self.args.verbose {
-            println!("      [API] Trying DataCite");
+            Self::log(&self.logger, "      [API] Trying DataCite");
         }
         
         if let Ok(response) = self.client
@@ -374,7 +429,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
                     
                     if !title.is_empty() {
                         if self.args.verbose {
-                            println!("      [API] DataCite success");
+                            Self::log(&self.logger, "      [API] DataCite success");
                         }
                         return Ok((title, abstract_text));
                     }
@@ -385,8 +440,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         Err(anyhow!("All DOI APIs failed"))
     }
 
-    // Scrape HTML tags or <abstract> sections (if available), for DOI and abstract text
-    async fn fetch_page_content(&self, url: &str) -> Result<(String, Option<String>)> { 
+    async fn fetch_page_content(&self, url: &str) -> Result<(String, Option<String>)> {
         let response = self.client
             .get(url)
             .timeout(Duration::from_secs(15))
@@ -473,11 +527,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             None => return Ok((true, 1.1, "AI disabled -_-".to_string())),
         };
 
-        let abstract_preview = if abstract_text.len() > 400 {
-            &abstract_text[..400]
-        } else {
-            abstract_text
-        };
+        let abstract_preview = Self::safe_truncate(abstract_text, 400);
 
         let prompt = format!(
             "You are evaluating if a scientific paper is relevant to a research topic.\n\n\
@@ -488,7 +538,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             Format your response EXACTLY like this:\n\
             SCORE: 0.85\n\
             REASON: This paper directly addresses machine learning algorithms for classification tasks.\n\n\
-            Be hyper strict only give high scores (0.8+) if the paper is directly about the topic.",
+            Be very strict only give high scores (0.85+) if the paper is directly about the topic.",
             subject, title, abstract_preview
         );
 
@@ -520,7 +570,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             }
             Err(e) => {
                 if self.args.verbose {
-                    println!("  [AI] Error: {}", e);
+                    Self::log(&self.logger, &format!("  [AI] Error: {}", e));
                 }
                 Ok((true, 0.7, "AI error, accepted by default".to_string()))
             }
@@ -528,10 +578,10 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
     }
 
     async fn process_result(&mut self, result: &SearchResult, index: usize) -> Result<Option<ScientificPaper>> {
-        println!("\n{}", "=".repeat(64));
-        println!("[{}/{}] {}", index + 1, self.args.max_results, &result.title);
-        println!("{}", "=".repeat(64));
-        println!("URL: {}", result.url);
+        Self::log(&self.logger, &format!("\n{}", "=".repeat(64)));
+        Self::log(&self.logger, &format!("[{}/{}] {}", index + 1, self.args.max_results, &result.title));
+        Self::log(&self.logger, &format!("{}", "=".repeat(64)));
+        Self::log(&self.logger, &format!("URL: {}", result.url));
 
         let mut doi = self.extract_doi_from_url(&result.url);
         let mut abstract_text = result.content.clone();
@@ -539,7 +589,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
 
         if doi.is_none() || abstract_text.len() < 100 {
             if self.args.verbose {
-                println!("   [FETCH] Scraping page for metadata");
+                Self::log(&self.logger, "   [FETCH] Scraping page for metadata");
             }
             if let Ok((page_abstract, page_doi)) = self.fetch_page_content(&result.url).await {
                 if doi.is_none() {
@@ -552,16 +602,16 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         }
 
         if let Some(ref doi_str) = doi {
-            println!("DOI: {}", doi_str);
+            Self::log(&self.logger, &format!("DOI: {}", doi_str));
             
             if self.processed_dois.contains(doi_str) {
-                println!("SKIPPED: Already processed\n");
+                Self::log(&self.logger, "SKIPPED: Already processed\n");
                 return Ok(None);
             }
 
             if abstract_text.len() < 100 {
                 if self.args.verbose {
-                    println!("   [API] Fetching metadata from DOI APIs");
+                    Self::log(&self.logger, "   [API] Fetching metadata from DOI APIs");
                 }
                 if let Ok((api_title, api_abstract)) = self.fetch_doi_metadata(doi_str).await {
                     if !api_title.is_empty() {
@@ -573,36 +623,36 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
                 }
             }
         } else {
-            println!("DOI: Not found");
+            Self::log(&self.logger, "DOI: Not found");
         }
 
         if abstract_text.len() > 50 {
-            println!("Abstract: {} chars", abstract_text.len());
+            Self::log(&self.logger, &format!("Abstract: {} chars", abstract_text.len()));
             let preview = if abstract_text.len() > 200 {
-                format!("{}...", &abstract_text[..200])
+                format!("{}...", Self::safe_truncate(&abstract_text, 200))
             } else {
                 abstract_text.clone()
             };
-            println!("   \"{}\"", preview);
+            Self::log(&self.logger, &format!("   \"{}\"", preview));
         } else {
-            println!("Abstract: None found (using title only)");
+            Self::log(&self.logger, "Abstract: None found (using title only)");
             abstract_text = title.clone();
         }
 
         let (is_relevant, score, reason) = if self.use_ai {
-            println!("\nAI Evaluation:");
+            Self::log(&self.logger, "\nAI Evaluation:");
             self.validate_with_ai(&title, &abstract_text, &self.args.subject).await?
         } else {
             (true, 0.8, "AI disabled".to_string())
         };
 
-        println!("   Score: {:.2}/1.0", score);
-        println!("   Reason: {}", reason);
+        Self::log(&self.logger, &format!("   Score: {:.2}/1.0", score));
+        Self::log(&self.logger, &format!("   Reason: {}", reason));
 
         if is_relevant {
-            println!("Relevant: Saving");
+            Self::log(&self.logger, "Relevant: Saving");
         } else {
-            println!("NOT Relevant: Skipping");
+            Self::log(&self.logger, "NOT Relevant: Skipping");
         }
 
         if !is_relevant {
@@ -644,11 +694,11 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         writeln!(file, "Abstract:\n{}", paper.abstract_text)?;
         writeln!(file, "{}\n", separator)?;
 
-        println!("SAVED to: {}", self.args.output);
+        Self::log(&self.logger, &format!("SAVED to: {}", self.args.output));
         Ok(())
     }
 
-    async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         let results = self.search_searxng().await?;
         
         let results_to_process = results.iter()
@@ -656,7 +706,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             .cloned()
             .collect::<Vec<_>>();
 
-        println!("\nProcessing results: {}\n", results_to_process.len());
+        Self::log(&self.logger, &format!("\nProcessing results: {}\n", results_to_process.len()));
 
         let mut validated = 0;
         let mut saved = 0;
@@ -674,7 +724,7 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
                     skipped += 1;
                 }
                 Err(e) => {
-                    println!("An error occured: {}", e);
+                    Self::log(&self.logger, &format!("An error occured: {}", e));
                 }
             }
             
@@ -683,20 +733,20 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             }
         }
 
-        println!("\n{}", "=".repeat(64));
-        println!("Results");
-        println!("{}", "=".repeat(64));
-        println!("Total processed: {}", results_to_process.len());
-        println!("Validated as relevant: {}", validated);
-        println!("Saved to file: {}", saved);
-        println!("Skipped: {}", skipped);
-        println!("Output: {}\n", self.args.output);
+        Self::log(&self.logger, &format!("\n{}", "=".repeat(64)));
+        Self::log(&self.logger, "Results");
+        Self::log(&self.logger, &format!("{}", "=".repeat(64)));
+        Self::log(&self.logger, &format!("Total processed: {}", results_to_process.len()));
+        Self::log(&self.logger, &format!("Validated as relevant: {}", validated));
+        Self::log(&self.logger, &format!("Saved to file: {}", saved));
+        Self::log(&self.logger, &format!("Skipped: {}", skipped));
+        Self::log(&self.logger, &format!("Output: {}\n", self.args.output));
 
         Ok(())
     }
     
     async fn search_searxng(&self) -> Result<Vec<SearchResult>> {
-        println!("Searching SearXNG instance\n");
+        Self::log(&self.logger, "Searching SearXNG instance\n");
         
         let mut params = vec![
             ("q", self.args.subject.as_str()),
@@ -716,25 +766,25 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
             
             if is_multiyear {
                 let years = time_range_value[..time_range_value.len()-4].parse::<u32>().unwrap();
-                println!("Warning!: Multi-year range '{}year' requested.", years);
-                println!("   Most SearXNG instances only support: day, week, month, year"); // experience
-                println!("   Falling back to 'year' (last 12 months)");
-                println!("   Tip: Use --time-range year and manually filter results by date\n");
+                Self::log(&self.logger, &format!("Warning!: Multi-year range '{}year' requested.", years));
+                Self::log(&self.logger, "   Most SearXNG instances only support: day, week, month, year");
+                Self::log(&self.logger, "   Falling back to 'year' (last 12 months)");
+                Self::log(&self.logger, "   Tip: Use --time-range year and manually filter results by date\n");
                 params.push(("time_range", "year"));
             } else if standard_ranges.contains(&time_range_value) {
                 params.push(("time_range", time_range_value));
-                println!("Applying time filter: {}\n", time_range_value);
+                Self::log(&self.logger, &format!("Applying time filter: {}\n", time_range_value));
             } else {
-                println!("Warning: Invalid time range '{}'. Valid options: day, week, month, year", time_range_value);
-                println!("   Continuing without time filter\n");
+                Self::log(&self.logger, &format!("Warning: Invalid time range '{}'. Valid options: day, week, month, year", time_range_value));
+                Self::log(&self.logger, "   Continuing without time filter\n");
             }
         }
 
         let url = format!("{}/search", self.args.instance.trim_end_matches('/'));
         
         if self.args.verbose {
-            println!("[DEBUG] URL: {}", url);
-            println!("[DEBUG] Params: {:?}\n", params);
+            Self::log(&self.logger, &format!("[DEBUG] URL: {}", url));
+            Self::log(&self.logger, &format!("[DEBUG] Params: {:?}\n", params));
         }
         
         let response = self.client
@@ -747,19 +797,16 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
         if !response.status().is_success() {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_else(|_| "Unable to read error body".to_string());
-            eprintln!("\nSearXNG Request Failed:");
-            eprintln!("   Status: {}", status);
-            eprintln!("   URL: {}", url);
-            eprintln!("   Params: {:?}", params);
-            eprintln!("   Error body: {}\n", error_body);
+            let error_msg = format!("\nSearXNG Request Failed:\n   Status: {}\n   URL: {}\n   Params: {:?}\n   Error body: {}\n", status, url, params, error_body);
+            Self::log(&self.logger, &error_msg);
             return Err(anyhow!("SearXNG error: {} - {}", status, error_body));
         }
 
         let data: SearxngResponse = response.json().await?;
-        println!("Found {} results from SearXNG\n", data.results.len());
+        Self::log(&self.logger, &format!("Found {} results from SearXNG\n", data.results.len()));
         
         if self.args.verbose && !data.results.is_empty() {
-            println!("[DEBUG] First result engine: {}", data.results[0].engine);
+            Self::log(&self.logger, &format!("[DEBUG] First result engine: {}", data.results[0].engine));
         }
         
         Ok(data.results)
@@ -767,10 +814,22 @@ impl DOIScraper { // Rust version of https://github.com/Servus-Altissimi/APA-7-L
 }
 
 
-// Parse CL arguments, init scraper
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let mut scraper = DOIScraper::new(args).await?;
-    scraper.run().await
+    
+    if std::env::args().len() <= 1 {
+        println!("{}", "=".repeat(64));
+        println!("  Researcher");
+        println!("{}", "=".repeat(64));
+        println!("No CL flags detected");
+        println!("Starting web interface on port {}\n", args.web_poort);
+        
+        web::start_web_server(args.web_poort).await;
+        
+        Ok(())
+    } else {
+        let mut scraper = DOIScraper::new(args).await?;
+        scraper.run().await
+    }
 }
